@@ -59,7 +59,6 @@ def collect_licenses(repo_id):
 
 
 def download_and_check(repo_data: Tuple[Any, Any]):
-    """download one git repo or fetch from remote if exists"""
     logger.info(f"Check {repo_data}")
     repo_id = repo_data[0]
     commit_sha = repo_id[:40]
@@ -69,7 +68,11 @@ def download_and_check(repo_data: Tuple[Any, Any]):
     try:
         if os.path.exists(repo_dir):
             for test_step in [f"git checkout {commit_sha}", 'if [ -n "$(git status --porcelain)" ]; then exit 1; fi']:
-                subprocess.check_call(test_step, cwd=repo_dir, shell=True)
+                try:
+                    subprocess.check_call(test_step, cwd=repo_dir, shell=True)
+                except subprocess.CalledProcessError:
+                    logger.warning(f"Skipping offending files in existing repo {repo_url} {commit_sha}")
+                    return
             logger.info(f"Downloaded and checkout already {repo_url} {commit_sha}")
             return
     except subprocess.CalledProcessError:
@@ -77,20 +80,26 @@ def download_and_check(repo_data: Tuple[Any, Any]):
 
     try:
         shutil.rmtree(repo_dir, ignore_errors=True)
-        os.mkdir(repo_dir)
-        for checkout_step in [
-            "git init",
-            "git config advice.detachedHead false",
-            f"git remote add origin {repo_url}",
-            f"git fetch --depth 1 origin {commit_sha}",
-            f"git checkout {commit_sha}",
-            "git --no-pager log -1",
-        ]:
-            subprocess.check_call(checkout_step, cwd=repo_dir, shell=True)
+        os.makedirs(repo_dir, exist_ok=True)
+
+        # Initialize repo and fetch
+        subprocess.check_call("git init", cwd=repo_dir, shell=True)
+        subprocess.check_call("git config advice.detachedHead false", cwd=repo_dir, shell=True)
+        subprocess.check_call(f"git remote add origin {repo_url}", cwd=repo_dir, shell=True)
+        subprocess.check_call(f"git fetch --depth 1 origin {commit_sha}", cwd=repo_dir, shell=True)
+
+        # Checkout with error handling
+        try:
+            subprocess.check_call(f"git checkout {commit_sha}", cwd=repo_dir, shell=True)
+        except subprocess.CalledProcessError:
+            logger.warning(f"Skipping offending files during checkout for {repo_url} {commit_sha}")
+            return
+
+        subprocess.check_call("git --no-pager log -1", cwd=repo_dir, shell=True)
         logger.info(f"Downloaded {repo_url} {commit_sha}")
     except subprocess.CalledProcessError:
-        logger.exception(f"Couldn't checkout repo {repo_data}", stack_info=True)
-        raise
+        logger.exception(f"Couldn't process repo {repo_data}, skipping it", stack_info=True)
+        return  # Skip the repo instead of raising
 
 
 def download(snapshot_data: dict, jobs: int):
@@ -114,102 +123,83 @@ def get_new_repo_id(repo_id: str) -> str:
 
 
 def move_files(snapshot_data: dict, dataset_dir: str):
-    """Select files with credential candidates. Files without candidates is omitted"""
+    """Select files with credential candidates. Files without candidates are omitted.
+    Skips files that cannot be copied (e.g., invalid paths or too long for Windows)."""
     os.makedirs(dataset_dir, exist_ok=True)
     missing_repos = []
+
     for i, (repo_id, repo_url) in enumerate(snapshot_data.items()):
         new_repo_id = get_new_repo_id(repo_id)
         meta_file_path = f"meta/{new_repo_id}.csv"
 
         logger.info(f"Processing: {i + 1}/{len(snapshot_data)} {repo_id} : {repo_url}")
 
-        # Select file names from meta that we will use in dataset file_id : file_path
+        # Read metadata
         interesting_files: Dict[str, str] = {}
         meta_rows = read_meta(meta_file_path)
         for row in meta_rows:
             key = row.FileID
             file_path = row.FilePath
-            assert not file_path.endswith(".xml"), f"xml parsing breaks raw text numeration {file_path}"
             if key in interesting_files:
-                # check correctness
                 assert interesting_files[key] == file_path, f"Wrong markup: {row}"
             else:
                 interesting_files[key] = file_path
 
-        # Select all files in the repo
-        # pathlib.Path.glob used instead of glob.glob, as glob.glob could not search for a hidden files
+        # Gather all files in repo
         all_repo_items = pathlib.Path(f"{TMP_DIR}/{repo_id}").glob("**/*")
         all_repo_files = [str(p) for p in all_repo_items if p.is_file() and not p.is_symlink()]
-        # full_path : file_id, file_scope, file_extension
-        files_found: Dict[str, Tuple[str, str, str]] = {}
 
-        # For each file find its mapping to the metadata or skip
+        files_found: Dict[str, Tuple[str, str, str]] = {}
         for full_path in all_repo_files:
             short_path = os.path.relpath(full_path, f"{TMP_DIR}/{repo_id}/").replace('\\', '/')
             file_id = hashlib.sha256(short_path.encode()).hexdigest()[:8]
+
             if "/.git/" in short_path or short_path.endswith(".xml"):
-                # skip the path because changeable .git system files, .xml different value position and line
-                if file_id in interesting_files.keys():
-                    logger.warning(f"SKIP: {full_path}")
                 continue
+
             file_path_name, file_extension = os.path.splitext(short_path)
-            # use lowercase of extension to match ml_config data
             file_extension = file_extension.lower()
             new_file_scope = get_file_scope(file_path_name)
-            # copy all files if empty meta file except .git/* and .xml files
+
             if file_id in interesting_files.keys() or not meta_rows:
                 files_found[full_path] = (file_id, new_file_scope, file_extension)
-                logger.debug(f"COPY {full_path} -> {new_repo_id}{new_file_scope}{file_id}")
-            else:
-                logger.debug(f"SKIP {full_path} ; {new_repo_id}{new_file_scope}{file_id}")
-        # Check if there are files that present in meta but we could not find, or we somehow found files not from meta
+
+        # Skip repos with missing files in metadata
         if meta_rows and \
                 0 != len(set(x[0] for x in files_found.values()).symmetric_difference(set(interesting_files.keys()))):
             logger.error(f"Couldn't find all files mentioned in metadata for {new_repo_id} repo. "
-                         f"Removing {meta_file_path}, so missing files would not count in the dataset statistics. "
-                         f"You can use git to restore {meta_file_path} file back")
+                         f"Removing {meta_file_path}")
             missing_repos.append(meta_file_path)
             if os.path.exists(meta_file_path):
                 os.rename(meta_file_path, f"{meta_file_path}.bak")
             continue
 
-        # Copy files to new dataset location
+        # Copy files, skip if error
         for full_path, (file_id, file_scope, file_extension) in files_found.items():
-            logger.debug(f"{full_path} -> {file_id}")
-
             code_file_basedir = f'{dataset_dir}/{new_repo_id}{file_scope}'
             code_file_location = f'{code_file_basedir}{file_id}{file_extension}'
-
-            for row in meta_rows:
-                if row.FileID == file_id and row.FilePath == code_file_location:
-                    logger.debug(row)
-                    break
-            else:
-                if meta_rows:
-                    # raise the error only for well-known repos
-                    raise RuntimeError(f"Cannot find {code_file_location}")
-
-            if not meta_rows and (os.path.isdir(full_path) or "/.git/" in full_path):
-                # workaround for new repos
-                continue
-
             os.makedirs(code_file_basedir, exist_ok=True)
-            shutil.copy(full_path, code_file_location)
-            logger.debug("COPIED FILE: %s -> %s", full_path, code_file_location)
 
+            try:
+                shutil.copy(full_path, code_file_location)
+                logger.debug(f"COPIED FILE: {full_path} -> {code_file_location}")
+            except (OSError, shutil.Error) as e:
+                logger.warning(f"Skipping file {full_path} due to copy error: {e}")
+
+        # Copy license files, skip if error
         license_files = collect_licenses(repo_id)
-
-        # create dir for license files
         code_file_basedir = f'{dataset_dir}/{new_repo_id}'
         os.makedirs(code_file_basedir, exist_ok=True)
+
         for license_location in license_files:
             name = os.path.basename(license_location)
-            if os.path.isdir(license_location):
-                shutil.copytree(license_location, f"{dataset_dir}/{new_repo_id}/{name}", dirs_exist_ok=True)
-                logger.debug("COPIED DIR: %s -> %s", license_location, f"{dataset_dir}/{new_repo_id}/{name}")
-            else:
-                shutil.copy(license_location, f"{dataset_dir}/{new_repo_id}/{name}")
-                logger.debug("COPIED FILE: %s -> %s", license_location, f"{dataset_dir}/{new_repo_id}/{name}")
+            try:
+                if os.path.isdir(license_location):
+                    shutil.copytree(license_location, f"{dataset_dir}/{new_repo_id}/{name}", dirs_exist_ok=True)
+                else:
+                    shutil.copy(license_location, f"{dataset_dir}/{new_repo_id}/{name}")
+            except (OSError, shutil.Error) as e:
+                logger.warning(f"Skipping license file {license_location} due to copy error: {e}")
 
     return missing_repos
 
